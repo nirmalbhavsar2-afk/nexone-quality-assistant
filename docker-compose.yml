@@ -1,0 +1,37 @@
+# Reference compose file for running NexOne Quality Assistant (Team Edition)
+# on a small cloud VM (e.g. a $6-12/mo droplet/Lightsail/VPS) behind a
+# reverse proxy that terminates HTTPS (see DEPLOY.md for the Caddy example).
+#
+# Usage:
+#   1. Copy .env.example to .env and fill in real values (especially
+#      JWT_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD, and optionally
+#      ANTHROPIC_API_KEY for live AI scoring).
+#   2. docker compose up -d --build
+#   3. The app is now listening on the host at the port you chose below.
+#      Put a reverse proxy (Caddy/nginx/Render/Railway/etc.) in front of it
+#      for HTTPS - see DEPLOY.md.
+
+services:
+  app:
+    build: .
+    image: nexone-quality-assistant:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - DATA_DIR=/data
+      - NODE_ENV=production
+      - PORT=3000
+    ports:
+      # Host port 8080 -> container port 3000. Change the host side if you
+      # already have something on 8080, or remove this entirely if a
+      # reverse proxy on the same Docker network will talk to the app
+      # over the internal network instead.
+      - "8080:3000"
+    volumes:
+      # Named volume so the SQLite database (all users/projects/candidates)
+      # survives container rebuilds and redeploys.
+      - nexone_data:/data
+
+volumes:
+  nexone_data:
