@@ -4,6 +4,7 @@ const db = require("../db");
 const { uid, requireAuth, requireRole } = require("../auth");
 const { rowToProject, rowToCandidate, getProject, listProjects, projectStats, touchProject } = require("../repo");
 const Engine = require("../engine");
+const { enrichFromLinkedInUrl } = require("../pdl");
 const { extractTextFromBuffer } = require("../extractText");
 const { DEFAULT_WEIGHTS, DEFAULT_EXPORT_COLUMNS, EXPORT_COLUMN_LABELS, SAMPLE_JD_TEXT, SAMPLE_JD_STRUCTURED, SAMPLE_CANDIDATES } = require("../data/taxonomy");
 
