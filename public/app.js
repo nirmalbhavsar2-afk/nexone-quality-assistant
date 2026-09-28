@@ -214,6 +214,7 @@ function topbarTitle() {
     case "reports": return "Reports";
     case "settings": return "Settings";
     case "candidate-detail": return "Candidate Review";
+    case "edit-requirements": return State.editReq ? "Edit Requirements — " + escapeHtml(State.editReq.projectName) : "Edit Requirements";
     default: return "";
   }
 }
@@ -223,6 +224,7 @@ function topbarActions() {
       <button class="btn btn-sm btn-primary" onclick="exportCSV()">&#8681; Download CSV</button>`;
   }
   if (State.view === "candidate-detail") return `<button class="btn btn-sm" onclick="goto('candidates')">&larr; Back to Candidates</button>`;
+  if (State.view === "edit-requirements") return `<button class="btn btn-sm" onclick="cancelEditRequirements()">&larr; Cancel</button>`;
   return `<button class="btn btn-sm btn-primary" onclick="goto('new-review')">+ New Review</button>`;
 }
 function renderView() {
@@ -234,6 +236,7 @@ function renderView() {
     case "projects": return viewProjects();
     case "reports": return viewReports();
     case "settings": return viewSettings();
+    case "edit-requirements": return viewEditRequirements();
     default: return "";
   }
 }
@@ -306,6 +309,11 @@ function viewProjects() {
             <div class="muted small">Created: ${new Date(p.createdAt).toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" })}</div></div>
           <button class="btn btn-sm btn-primary" onclick="openProjectAndGoto('${p.id}')">Reopen</button>
         </div>
+        <div class="flex gap-8 mt-8">
+          ${!isReadOnly() ? `<button class="btn btn-sm" onclick="openRenameProject('${p.id}')">Rename</button>` : ""}
+          ${!isReadOnly() ? `<button class="btn btn-sm" onclick="openEditRequirements('${p.id}')">Edit Requirements</button>` : ""}
+          ${canEditSettings() ? `<button class="btn btn-sm" style="border-color:var(--red-700);color:var(--red-700)" onclick="confirmDeleteProject('${p.id}')">Delete</button>` : ""}
+        </div>
         <div class="divider"></div>
         <div class="kv">
           <span class="muted">Candidates</span><b>${p.stats.total}</b>
@@ -315,6 +323,51 @@ function viewProjects() {
         </div>
       </div>`).join("")}
   </div>`;
+}
+
+/* ============================== PROJECT RENAME / DELETE =================== */
+
+function openRenameProject(id) {
+  const p = State.projects.find(x => x.id === id);
+  if (!p) return;
+  Modal.open({
+    title: "Rename Project",
+    body: `<div class="field"><label>Project Name</label><input class="input" id="renameProjectInput" value="${escapeHtml(p.name)}"/></div>`,
+    footer: `<button class="btn" onclick="Modal.close()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitRenameProject('${id}')">Save</button>`
+  });
+}
+async function submitRenameProject(id) {
+  const input = document.getElementById("renameProjectInput");
+  const name = input.value.trim();
+  if (!name) { toast("Project name can't be empty.", "err"); return; }
+  try {
+    await apiPut(`/projects/${id}`, { name });
+    if (State.currentProject && State.currentProject.id === id) State.currentProject.name = name;
+    Modal.close();
+    await loadProjects();
+    toast("Project renamed.", "ok");
+  } catch (e) { toast("Could not rename project: " + e.message, "err"); }
+}
+
+function confirmDeleteProject(id) {
+  const p = State.projects.find(x => x.id === id);
+  if (!p) return;
+  Modal.open({
+    title: "Delete Project",
+    body: `<p>Are you sure you want to permanently delete <b>${escapeHtml(p.name)}</b>? This will remove all ${p.stats.total} candidate(s) and their reviews. This cannot be undone.</p>`,
+    footer: `<button class="btn" onclick="Modal.close()">Cancel</button>
+      <button class="btn btn-primary" style="background:var(--red-700);border-color:var(--red-700)" onclick="submitDeleteProject('${id}')">Delete Project</button>`
+  });
+}
+async function submitDeleteProject(id) {
+  try {
+    await apiDelete(`/projects/${id}`);
+    Modal.close();
+    if (State.currentProject && State.currentProject.id === id) { State.currentProject = null; await goto("dashboard"); }
+    else { await loadProjects(); }
+    toast("Project deleted.", "ok");
+  } catch (e) { toast("Could not delete project: " + e.message, "err"); }
 }
 
 /* ============================== NEW REVIEW WIZARD ========================= */
@@ -729,6 +782,90 @@ async function launchReview() {
   }
 }
 
+/* ============================== EDIT REQUIREMENTS (existing project) ====== */
+
+async function openEditRequirements(projectId) {
+  let full;
+  try { full = await apiGet(`/projects/${projectId}`); }
+  catch (e) { toast("Could not load project: " + e.message, "err"); return; }
+  State.editReq = {
+    projectId: full.id,
+    projectName: full.name,
+    jd: JSON.parse(JSON.stringify(full.jd))
+  };
+  goto("edit-requirements");
+}
+
+function viewEditRequirements() {
+  const er = State.editReq;
+  if (!er) return `<div class="empty-state card"><p>No project selected.</p></div>`;
+  const jd = er.jd;
+  return `<div class="content-narrow">
+    <div class="card">
+      <div class="card-title">Edit Requirements — ${escapeHtml(er.projectName)}</div>
+      <div class="card-sub">Changes apply going forward. Re-run analysis on existing candidates (from the Candidates page) to apply updated requirements to them.</div>
+      <div class="row">
+        <div class="field"><label>Job Title</label><input class="input" value="${escapeHtml(jd.title)}" oninput="State.editReq.jd.title=this.value"/></div>
+        <div class="field"><label>Location</label><input class="input" value="${escapeHtml(jd.location)}" oninput="State.editReq.jd.location=this.value"/></div>
+      </div>
+      <div class="row">
+        <div class="field"><label>Min Years Experience</label><input type="number" class="input" value="${jd.minExperience}" oninput="State.editReq.jd.minExperience=Number(this.value)"/></div>
+        <div class="field"><label>Max Years Experience</label><input type="number" class="input" value="${jd.maxExperience}" oninput="State.editReq.jd.maxExperience=Number(this.value)"/></div>
+      </div>
+      <div class="field"><label>Job Description Text</label>
+        <textarea class="input" rows="8" oninput="State.editReq.jd.rawText=this.value">${escapeHtml(jd.rawText)}</textarea></div>
+    </div>
+    <div class="card">
+      <div class="grid grid-2">
+        <div class="field"><label>Required Skills</label>${chipInputHtml("State.editReq.jd.requiredSkills", jd.requiredSkills, "Add required skill")}</div>
+        <div class="field"><label>Preferred / Nice-to-Have Skills</label>${chipInputHtml("State.editReq.jd.preferredSkills", jd.preferredSkills, "Add preferred skill")}</div>
+        <div class="field"><label>Required Software / Tools</label>${chipInputHtml("State.editReq.jd.requiredTools", jd.requiredTools, "Add tool")}</div>
+        <div class="field"><label>Required Industries</label>${chipInputHtml("State.editReq.jd.industries", jd.industries, "Add industry")}</div>
+        <div class="field"><label>Education Requirements</label>${chipInputHtml("State.editReq.jd.education", jd.education, "Add education requirement")}</div>
+        <div class="field"><label>Certification Requirements</label>${chipInputHtml("State.editReq.jd.certifications", jd.certifications, "Add certification")}</div>
+        <div class="field"><label>Domain Experience</label>${chipInputHtml("State.editReq.jd.domain", jd.domain, "Add domain")}</div>
+        <div class="field"><label>Location / Work-Authorization Requirements</label>${chipInputHtml("State.editReq.jd.locationRequirements", jd.locationRequirements, "Add requirement")}</div>
+      </div>
+      <div class="divider"></div>
+      <div class="card-title">Must-Have (Hard) Requirements</div>
+      <table class="tbl"><thead><tr><th>Requirement</th><th>Type</th><th>Auto-Disqualify</th><th></th></tr></thead>
+        <tbody>${jd.mandatoryRequirements.map((r, i) => `<tr>
+          <td><input class="input" value="${escapeHtml(r.text)}" oninput="State.editReq.jd.mandatoryRequirements[${i}].text=this.value"/></td>
+          <td><select class="input" onchange="State.editReq.jd.mandatoryRequirements[${i}].type=this.value">
+            ${["experience", "skill", "education", "other"].map(t => `<option value="${t}" ${r.type === t ? "selected" : ""}>${t}</option>`).join("")}</select></td>
+          <td style="text-align:center"><input type="checkbox" ${r.disqualifying ? "checked" : ""} onchange="State.editReq.jd.mandatoryRequirements[${i}].disqualifying=this.checked"/></td>
+          <td><button class="btn btn-sm btn-ghost" onclick="State.editReq.jd.mandatoryRequirements.splice(${i},1);render()">Remove</button></td>
+        </tr>`).join("")}</tbody>
+      </table>
+      <button class="btn btn-sm mt-8" onclick="State.editReq.jd.mandatoryRequirements.push({id: uid('req'), text: '', type: 'skill', disqualifying: false});render()">+ Add Must-Have Requirement</button>
+    </div>
+    <div class="flex-between mt-20">
+      <button class="btn" onclick="cancelEditRequirements()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveEditRequirements()">Save Requirements</button>
+    </div>
+  </div>`;
+}
+
+function cancelEditRequirements() {
+  const hadProject = !!State.currentProject;
+  State.editReq = null;
+  goto(hadProject ? "candidates" : "projects");
+}
+
+async function saveEditRequirements() {
+  const er = State.editReq;
+  if (!er) return;
+  try {
+    const updated = await apiPut(`/projects/${er.projectId}`, { jd: er.jd });
+    const hadProject = State.currentProject && State.currentProject.id === er.projectId;
+    if (hadProject) State.currentProject = updated;
+    State.editReq = null;
+    await loadProjects();
+    toast("Requirements updated. Re-run analysis to apply to existing candidates.", "ok");
+    goto(hadProject ? "candidates" : "projects");
+  } catch (e) { toast("Could not save requirements: " + e.message, "err"); }
+}
+
 /* ============================== BULK ANALYSIS ============================= */
 
 async function runBulkAnalysis(projectId, onlyFailed) {
@@ -800,6 +937,7 @@ function viewCandidates() {
     <div class="flex-between">
       <div class="card-title" style="margin:0">Candidate Leaderboard <span class="muted small" style="font-weight:400">${list.length} of ${p.candidates.length} shown</span></div>
       <div class="flex gap-8">
+        ${!isReadOnly() ? `<button class="btn btn-sm" onclick="openAddCandidatesModal()">+ Add Candidates</button>` : ""}
         ${notYetProcessed > 0 ? `<button class="btn btn-sm btn-primary" onclick="runBulkAnalysis('${p.id}')">Analyze ${notYetProcessed} Pending</button>` : ""}
       </div>
     </div>
@@ -853,6 +991,107 @@ function sortArrow(key) { if (State.candSort.key !== key) return ""; return `<sp
 function setSort(key) { if (State.candSort.key === key) State.candSort.dir = State.candSort.dir === "asc" ? "desc" : "asc"; else { State.candSort.key = key; State.candSort.dir = "desc"; } render(); }
 function recBadge(rec) { const map = { "Strongly Recommend": "badge-green", "Recommend": "badge-blue", "Consider": "badge-amber", "Do Not Recommend": "badge-red" }; return `<span class="badge ${map[rec] || "badge-gray"}">${escapeHtml(rec)}</span>`; }
 function qaBadge(s) { const map = { "Not Reviewed": "badge-gray", "Reviewed": "badge-blue", "Approved": "badge-green", "Rejected": "badge-red", "Needs Verification": "badge-amber" }; return `<span class="badge ${map[s] || "badge-gray"}">${escapeHtml(s)}</span>`; }
+
+/* ============================== ADD CANDIDATES (existing project) ========= */
+
+function openAddCandidatesModal() {
+  State.addCand = { candidates: [] };
+  renderAddCandidatesModal();
+}
+function renderAddCandidatesModal() {
+  const draft = State.addCand;
+  Modal.open({
+    title: `Add Candidates — ${escapeHtml(State.currentProject.name)}`,
+    wide: true,
+    body: `
+      <div class="field"><label>LinkedIn Profiles</label>
+        <div class="muted small">Paste one LinkedIn URL per line. Candidates already in this project are skipped automatically.</div>
+        <textarea class="input" rows="5" id="addCandBulkInput" placeholder="https://www.linkedin.com/in/candidate-one/&#10;https://www.linkedin.com/in/candidate-two/"></textarea>
+        <button class="btn btn-sm mt-8" onclick="bulkAddToAddCandModal()">+ Add URLs</button>
+      </div>
+      <div class="field"><label>Resume Upload <span class="muted small" style="font-weight:400">optional &middot; PDF / DOC / DOCX</span></label>
+        <label class="dropzone" style="display:block;cursor:pointer;">
+          <input type="file" multiple accept=".pdf,.doc,.docx,.txt" style="display:none" onchange="handleAddCandResumeUpload(event)"/>
+          &#128194; Click to upload resumes (auto-matched to candidates by name where possible)
+        </label>
+      </div>
+      <div class="field"><label>Candidates to Add (${draft.candidates.length})</label>
+        ${draft.candidates.length === 0 ? `<p class="muted small">None added yet.</p>` : `
+        <table class="tbl"><thead><tr><th>Name</th><th>LinkedIn URL</th><th>Resume</th><th></th></tr></thead>
+          <tbody>${draft.candidates.map((c, i) => `<tr>
+            <td><input class="input" value="${escapeHtml(c.name)}" oninput="State.addCand.candidates[${i}].name=this.value"/></td>
+            <td><input class="input" value="${escapeHtml(c.linkedinUrl)}" oninput="State.addCand.candidates[${i}].linkedinUrl=this.value"/>
+              ${c._invalid ? '<div class="badge badge-amber mt-8">Invalid URL</div>' : ""}</td>
+            <td>${c.resumeFileName ? `<span class="badge badge-green">${escapeHtml(c.resumeFileName)}</span>` : `<span class="badge badge-gray">No resume</span>`}</td>
+            <td><button class="btn btn-sm btn-ghost" onclick="State.addCand.candidates.splice(${i},1);renderAddCandidatesModal()">Remove</button></td>
+          </tr>`).join("")}</tbody></table>`}
+      </div>`,
+    footer: `<button class="btn" onclick="Modal.close()">Cancel</button>
+      <button class="btn btn-primary" onclick="submitAddCandidates()" ${draft.candidates.length === 0 ? "disabled" : ""}>Add ${draft.candidates.length} Candidate(s)</button>`
+  });
+}
+function bulkAddToAddCandModal() {
+  const raw = document.getElementById("addCandBulkInput").value;
+  const lines = raw.split("\n").map(l => l.trim()).filter(Boolean);
+  const existingUrls = new Set([
+    ...State.currentProject.candidates.map(c => normalizeUrl(c.linkedinUrl)),
+    ...State.addCand.candidates.map(c => normalizeUrl(c.linkedinUrl))
+  ]);
+  let added = 0, dup = 0, invalid = 0;
+  lines.forEach(line => {
+    const norm = normalizeUrl(line);
+    if (existingUrls.has(norm)) { dup++; return; }
+    existingUrls.add(norm);
+    State.addCand.candidates.push({
+      name: nameFromLinkedInUrl(line), linkedinUrl: line, resumeFileName: "", resumeText: "", linkedinText: "",
+      _invalid: !isValidLinkedInUrl(line)
+    });
+    if (!isValidLinkedInUrl(line)) invalid++;
+    added++;
+  });
+  toast(`Added ${added} candidate(s) to the list.${dup ? " " + dup + " duplicate(s) skipped." : ""}${invalid ? " " + invalid + " URL(s) flagged invalid." : ""}`, "ok");
+  renderAddCandidatesModal();
+}
+async function handleAddCandResumeUpload(evt) {
+  const files = Array.from(evt.target.files || []);
+  for (const file of files) {
+    let text = "";
+    try {
+      const fd = new FormData(); fd.append("file", file);
+      const result = await apiPost("/files/extract-text", fd);
+      text = result.text;
+    } catch (e) { toast(`Could not parse ${file.name}: ${e.message}`, "err"); continue; }
+    const norm = s => (s || "").toLowerCase().replace(/[^a-z]/g, "");
+    const fnNorm = norm(file.name);
+    let best = null, bestScore = 0;
+    State.addCand.candidates.forEach(c => {
+      if (c.resumeText) return;
+      const nameNorm = norm(c.name);
+      if (!nameNorm) return;
+      let score = 0;
+      if (fnNorm.includes(nameNorm) || nameNorm.includes(fnNorm.slice(0, Math.min(8, fnNorm.length)))) score += 2;
+      c.name.toLowerCase().split(/\s+/).filter(t => t.length > 2).forEach(t => { if (fnNorm.includes(t) || (text || "").toLowerCase().includes(t)) score += 1; });
+      if (score > bestScore) { bestScore = score; best = c; }
+    });
+    if (bestScore >= 2 && best) { best.resumeFileName = file.name; best.resumeText = text; toast(`Matched ${file.name} to ${best.name}.`, "ok"); }
+    else {
+      State.addCand.candidates.push({ name: file.name.replace(/\.[^.]+$/, "").replace(/[_\-]/g, " "), linkedinUrl: "", resumeFileName: file.name, resumeText: text, linkedinText: "" });
+      toast(`${file.name} could not be confidently matched — added as new candidate for manual matching.`, "err");
+    }
+  }
+  renderAddCandidatesModal();
+}
+async function submitAddCandidates() {
+  const p = State.currentProject;
+  const candidates = State.addCand.candidates.map(c => ({ name: c.name, linkedinUrl: c.linkedinUrl, resumeFileName: c.resumeFileName, resumeText: c.resumeText, linkedinText: c.linkedinText }));
+  try {
+    const resp = await apiPost(`/projects/${p.id}/candidates`, { candidates });
+    Modal.close();
+    State.addCand = null;
+    await refreshCurrentProject();
+    toast(`Added ${resp.added} candidate(s).${resp.skipped ? " " + resp.skipped + " duplicate(s) skipped." : ""}`, "ok");
+  } catch (e) { toast("Could not add candidates: " + e.message, "err"); }
+}
 
 /* ============================== CANDIDATE DETAIL =========================== */
 
