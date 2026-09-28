@@ -194,7 +194,16 @@ router.post("/:id/analyze", async (req, res) => {
     for (const row of targets) {
       db.prepare("UPDATE candidates SET status='processing' WHERE id=?").run(row.id);
       try {
-        const cand = rowToCandidate(db.prepare("SELECT * FROM candidates WHERE id = ?").get(row.id));
+                let cand = rowToCandidate(db.prepare("SELECT * FROM candidates WHERE id = ?").get(row.id));
+        if (!cand.resumeText && !cand.linkedinText && cand.linkedinUrl) {
+          try {
+            const enrichedText = await enrichFromLinkedInUrl(cand.linkedinUrl);
+            db.prepare("UPDATE candidates SET linkedin_text=?, updated_at=datetime('now') WHERE id=?").run(enrichedText, row.id);
+            cand = rowToCandidate(db.prepare("SELECT * FROM candidates WHERE id = ?").get(row.id));
+          } catch (pdlErr) {
+            throw new Error(`LinkedIn enrichment failed: ${pdlErr.message}`);
+          }
+        }
         if (!cand.resumeText && !cand.linkedinText) throw new Error("No resume or profile text available");
         const jd = p.jd;
         const weights = p.weights;
