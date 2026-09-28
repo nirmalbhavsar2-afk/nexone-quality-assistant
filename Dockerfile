@@ -3,7 +3,7 @@
 # The SQLite file lives on a persistent volume mounted at /data so it
 # survives container restarts and redeploys.
 
-FROM node:20-bullseye-slim AS base
+FROM node:22-bookworm-slim AS base
 
 # better-sqlite3 ships prebuilt binaries for common platforms, but we keep
 # basic build tools available as a fallback so `npm install` never fails
