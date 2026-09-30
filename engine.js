@@ -315,10 +315,23 @@ function evaluateCandidate(candidate, jd, weights, screeningRules) {
   const allIntervals = mergeIntervals(extractIntervals(combinedText));
   const totalExperienceYears = sumYears(allIntervals);
 
+  // Context-based "automation domain" classification (industrial vs home vs IT vs marketing
+  // automation, etc.) exists to catch FALSE MATCHES for automation-engineering roles — e.g. a
+  // "Home Automation Specialist" whose experience shouldn't count toward an industrial-robotics
+  // requirement. It should only be applied when the job description actually flagged a
+  // context-specific requirement (contextTag set on a mandatory requirement, which the JD
+  // extractor only does when the requirement text itself mentions "robot", "industrial", or
+  // "plc"). For any other kind of role, none of AUTOMATION_CONTEXTS' keywords will ever appear
+  // in a candidate's work history, which used to silently zero out relevant experience for
+  // every candidate regardless of how well they actually matched. When no requirement specifies
+  // a contextTag, relevant experience is simply the candidate's total work-history experience —
+  // there's nothing automation-specific to disambiguate against.
   const acceptableTags = [];
   if (jd.mandatoryRequirements) jd.mandatoryRequirements.forEach(r => { if (r.contextTag) acceptableTags.push(...relatedTagsFor(r.contextTag)); });
-  if (acceptableTags.length === 0) acceptableTags.push("industrial", "robotics", "plc", "motionControl");
-  const { years: relevantExperienceYears, tagged } = relevantYearsForContexts(combinedText, acceptableTags);
+  const hasContextRequirement = acceptableTags.length > 0;
+  const { years: relevantExperienceYears, tagged } = hasContextRequirement
+    ? relevantYearsForContexts(combinedText, acceptableTags)
+    : { years: totalExperienceYears, tagged: [] };
 
   const dominantOffContext = (() => {
     const counts = {};
