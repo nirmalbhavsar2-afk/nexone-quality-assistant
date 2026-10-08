@@ -75,7 +75,16 @@ function relatedTagsFor(tag) { return RELATED_CONTEXTS[tag] || [tag]; }
 function relevantYearsForContexts(text, acceptableTags) {
   const intervals = extractIntervals(text);
   const tagged = intervals.map(iv => ({ ...iv, tag: classifyContext(iv.context) }));
-  const relevant = tagged.filter(iv => acceptableTags.includes(iv.tag) || iv.tag === null && /automation|robot|plc|manufactur|industrial/i.test(iv.context));
+  // A role with NO automation-context keyword at all (tag === null) has no signal either way —
+  // default it to relevant rather than requiring an explicit literal keyword match nearby. This
+  // mirrors the same default-include philosophy already used for non-context-tagged JDs: only
+  // exclude a role when it is CONFIDENTLY classified into a specific automation domain that isn't
+  // one of the job's accepted domains (e.g. Home/Marketing/IT/Test/RPA/AV automation for an
+  // industrial role). Previously, any role lacking the literal words "automation/robot/plc/
+  // manufactur/industrial" right next to its dates was silently zeroed out even when clearly
+  // relevant — e.g. a "Controls Technician" role described only via brand/tool names like
+  // "Allen-Bradley" or "SCADA" without ever using the word "automation" or "industrial" nearby.
+  const relevant = tagged.filter(iv => iv.tag === null || acceptableTags.includes(iv.tag));
   return { years: sumYears(mergeIntervals(relevant)), tagged };
 }
 
@@ -538,33 +547,109 @@ function evaluateCandidate(candidate, jd, weights, screeningRules) {
 /* ---------------- Optional live AI provider (org-wide Anthropic key) --- */
 
 async function callAnthropic(apiKey, model, systemPrompt, userPrompt) {
-  const resp = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model: model || "claude-sonnet-4-5", max_tokens: 1800, system: systemPrompt, messages: [{ role: "user", content: userPrompt }] })
-  });
-  if (!resp.ok) throw new Error(`AI provider error (${resp.status})`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
+  let resp;
+  try {
+    resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: model || "claude-sonnet-4-5", max_tokens: 3200, system: systemPrompt, messages: [{ role: "user", content: userPrompt }] }),
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+  if (!resp.ok) {
+    let detail = "";
+    try { const errBody = await resp.json(); detail = (errBody.error && errBody.error.message) || ""; } catch (e) { /* ignore */ }
+    throw new Error(`AI provider error (${resp.status})${detail ? ": " + detail : ""}`);
+  }
   const data = await resp.json();
-  const text = (data.content || []).map(c => c.text || "").join("");
+  let text = (data.content || []).map(c => c.text || "").join("");
+  // Models sometimes wrap JSON in a ```json ... ``` fence despite instructions not to — strip it.
+  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenceMatch) text = fenceMatch[1];
   const jsonMatch = text.match(/\{[\s\S]*\}/);
   if (!jsonMatch) throw new Error("AI provider returned no parseable JSON");
   return JSON.parse(jsonMatch[0]);
 }
 
+// Backstops any field a live-AI JSON response omits, mis-types, or gets wrong by falling back to
+// the deterministic engine's result for that field only — computed from the SAME candidate/JD —
+// so a partially-malformed model response degrades gracefully instead of corrupting the record.
+// Most importantly: relevantExperienceYears must never silently become 0 just because the model
+// left it out of its JSON.
+function normalizeLiveResult(result, deterministic) {
+  result = result && typeof result === "object" ? result : {};
+  result.candidateInfo = Object.assign({}, deterministic.candidateInfo, result.candidateInfo || {});
+  if (result.candidateInfo.relevantExperienceYears === undefined || result.candidateInfo.relevantExperienceYears === null || isNaN(Number(result.candidateInfo.relevantExperienceYears))) {
+    result.candidateInfo.relevantExperienceYears = deterministic.candidateInfo.relevantExperienceYears;
+  }
+  if (result.candidateInfo.totalExperienceYears === undefined || result.candidateInfo.totalExperienceYears === null || isNaN(Number(result.candidateInfo.totalExperienceYears))) {
+    result.candidateInfo.totalExperienceYears = deterministic.candidateInfo.totalExperienceYears;
+  }
+  result.skills = (result.skills && Array.isArray(result.skills.matched) && Array.isArray(result.skills.missing)) ? result.skills : deterministic.skills;
+  result.industryMatch = result.industryMatch || deterministic.industryMatch;
+  result.educationMatch = result.educationMatch || deterministic.educationMatch;
+  result.certificationMatch = result.certificationMatch || deterministic.certificationMatch;
+  result.workAuthorization = result.workAuthorization || deterministic.workAuthorization;
+  result.categoryScores = Object.assign({}, deterministic.categoryScores, result.categoryScores || {});
+  result.hardRequirements = Array.isArray(result.hardRequirements) ? result.hardRequirements : deterministic.hardRequirements;
+  result.hardFailBlocking = result.hardRequirements.some(r => r.status === "fail" && r.disqualifying);
+  result.overallScore = (typeof result.overallScore === "number" && !isNaN(result.overallScore)) ? clamp(result.overallScore, 0, 10) : deterministic.overallScore;
+  result.matchPercent = (typeof result.matchPercent === "number" && !isNaN(result.matchPercent)) ? result.matchPercent : Math.round(result.overallScore * 10);
+  result.recommendation = result.recommendation || recommendationFor(result.overallScore, result.hardFailBlocking);
+  result.confidence = result.confidence || deterministic.confidence;
+  result.explanation = result.explanation || deterministic.explanation;
+  result.redFlags = Array.isArray(result.redFlags) ? result.redFlags : deterministic.redFlags;
+  result.verificationItems = Array.isArray(result.verificationItems) ? result.verificationItems : deterministic.verificationItems;
+  result.consistency = result.consistency || deterministic.consistency;
+  result.strongestQualifications = Array.isArray(result.strongestQualifications) ? result.strongestQualifications : deterministic.strongestQualifications;
+  result.roleBreakdown = Array.isArray(result.roleBreakdown) ? result.roleBreakdown : [];
+  result.policyChecks = deterministic.policyChecks;
+  return result;
+}
+
 async function evaluateCandidateLive(candidate, jd, weights, screeningRules) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return evaluateCandidate(candidate, jd, weights, screeningRules);
+  // The deterministic pass always runs first and is used as a backstop for any field the live
+  // model omits or gets wrong — see normalizeLiveResult().
+  const deterministic = evaluateCandidate(candidate, jd, weights, screeningRules);
   try {
-    const sys = `You are an evidence-based recruiting quality-assurance AI. Never invent candidate experience. If information cannot be verified, respond with "Not Found" or "Needs Verification". Distinguish contextually similar but different domains (industrial vs home vs IT vs marketing automation). Return ONLY a single JSON object, no prose.`;
-    const userPrompt = `JOB DESCRIPTION (structured):\n${JSON.stringify(jd)}\n\nSCORING WEIGHTS:\n${JSON.stringify(weights)}\n\nCANDIDATE:\nName: ${candidate.name}\nLinkedIn URL: ${candidate.linkedinUrl}\nLinkedIn text:\n${candidate.linkedinText || "(none)"}\n\nResume text:\n${candidate.resumeText || "(none)"}\n\nReturn JSON with keys: candidateInfo, skills{matched,missing}, industryMatch, educationMatch, certificationMatch, workAuthorization, hardRequirements, categoryScores{technicalSkills,relevantExperience,industryDomain,toolsTech,responsibilities,educationCert,locationOther}, overallScore, matchPercent, recommendation, confidence, explanation, redFlags, verificationItems, consistency, strongestQualifications.`;
+    const sys = `You are an evidence-based recruiting quality-assurance AI. Never invent candidate experience — only use what is explicitly stated in the provided text. If information cannot be verified, respond with "Not Found" or "Needs Verification" rather than guessing. Distinguish contextually similar but different domains (e.g. industrial vs home vs IT vs marketing vs test automation) — experience in an unrelated domain should not count toward a required domain's relevant-experience total. Return ONLY a single JSON object, no prose, no markdown code fences.`;
+    const userPrompt = `JOB DESCRIPTION (structured):
+${JSON.stringify(jd)}
+
+SCORING WEIGHTS:
+${JSON.stringify(weights)}
+
+CANDIDATE:
+Name: ${candidate.name}
+LinkedIn URL: ${candidate.linkedinUrl}
+
+LinkedIn text:
+${candidate.linkedinText || "(none)"}
+
+Resume text:
+${candidate.resumeText || "(none)"}
+
+INSTRUCTIONS FOR CALCULATING EXPERIENCE (this is the most important part — get it right):
+1. List EVERY past role you can find in the LinkedIn text and resume text above, in a "roleBreakdown" array. For each role include: title, company, start, end (as written), yearsInRole (number), relevant (true/false — does this role's work count toward the job's required skills/domain?), and a one-sentence reason for that relevant/not-relevant call.
+2. Sum yearsInRole across ALL roles found (merge overlapping date ranges so they are only counted once) to get totalExperienceYears.
+3. Sum yearsInRole only for roles marked relevant:true to get relevantExperienceYears. Do NOT return 0 for relevantExperienceYears unless you genuinely find no relevant role anywhere in the text — re-check the full text for roles you may have missed before concluding there is none.
+4. Put totalExperienceYears and relevantExperienceYears inside candidateInfo, and also include the roleBreakdown array at the top level of the JSON.
+
+Return JSON with keys: candidateInfo (including totalExperienceYears, relevantExperienceYears, currentTitle, currentCompany, location, education, certifications), roleBreakdown, skills{matched,missing}, industryMatch, educationMatch, certificationMatch, workAuthorization, hardRequirements, categoryScores{technicalSkills,relevantExperience,industryDomain,toolsTech,responsibilities,educationCert,locationOther}, overallScore, matchPercent, recommendation, confidence, explanation, redFlags, verificationItems, consistency, strongestQualifications.`;
     const result = await callAnthropic(apiKey, process.env.ANTHROPIC_MODEL, sys, userPrompt);
-    result.provider = "anthropic:" + (process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5");
-    result.generatedAt = new Date().toISOString();
-    if (result.hardRequirements) result.hardFailBlocking = result.hardRequirements.some(r => r.status === "fail" && r.disqualifying);
-    return result;
+    const normalized = normalizeLiveResult(result, deterministic);
+    normalized.provider = "anthropic:" + (process.env.ANTHROPIC_MODEL || "claude-sonnet-4-5");
+    normalized.generatedAt = new Date().toISOString();
+    return normalized;
   } catch (err) {
     console.warn("Live AI evaluation failed, falling back to mock engine:", err.message);
-    const fallback = evaluateCandidate(candidate, jd, weights, screeningRules);
+    const fallback = deterministic;
     fallback.providerError = String(err.message || err);
     return fallback;
   }
