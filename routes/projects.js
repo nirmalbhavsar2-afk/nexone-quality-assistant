@@ -6,7 +6,7 @@ const { rowToProject, rowToCandidate, getProject, listProjects, projectStats, to
 const Engine = require("../engine");
 const { enrichFromLinkedInUrl } = require("../pdl");
 const { extractTextFromBuffer } = require("../extractText");
-const { DEFAULT_WEIGHTS, DEFAULT_EXPORT_COLUMNS, EXPORT_COLUMN_LABELS, SAMPLE_JD_TEXT, SAMPLE_JD_STRUCTURED, SAMPLE_CANDIDATES } = require("../data/taxonomy");
+const { DEFAULT_WEIGHTS, DEFAULT_EXPORT_COLUMNS, EXPORT_COLUMN_LABELS, SAMPLE_JD_TEXT, SAMPLE_JD_STRUCTURED, SAMPLE_CANDIDATES, ratingBand } = require("../data/taxonomy");
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
@@ -160,6 +160,109 @@ router.put("/candidates/:candId/qa", (req, res) => {
   res.json(rowToCandidate(db.prepare("SELECT * FROM candidates WHERE id = ?").get(c.id)));
 });
 
+/* ------------------------ Cross-project Candidates Database -------------- */
+// Feature: "Candidates" database view — every candidate across every project, with filters.
+// Registered as a two-segment path (/candidates/all) so it never collides with the single-segment
+// GET /:id project route or the existing /candidates/:candId routes above.
+router.get("/candidates/all", (req, res) => {
+  const { projectId, status, recommendation, band, qaStatus, search, missingMandatory, scoreMin, scoreMax } = req.query;
+  const projects = listProjects();
+  const projectNameById = {};
+  projects.forEach(p => { projectNameById[p.id] = p.name; });
+
+  const rows = projectId
+    ? db.prepare("SELECT * FROM candidates WHERE project_id = ? ORDER BY created_at DESC").all(projectId)
+    : db.prepare("SELECT * FROM candidates ORDER BY created_at DESC").all();
+
+  const min = scoreMin !== undefined ? Number(scoreMin) : 0;
+  const max = scoreMax !== undefined ? Number(scoreMax) : 10;
+
+  let list = rows.map(r => {
+    const c = rowToCandidate(r);
+    return {
+      id: c.id, projectId: c.projectId, projectName: projectNameById[c.projectId] || "(deleted project)",
+      name: c.name, linkedinUrl: c.linkedinUrl, status: c.status,
+      ai: c.ai ? {
+        overallScore: c.ai.overallScore, matchPercent: c.ai.matchPercent, recommendation: c.ai.recommendation,
+        hardFailBlocking: c.ai.hardFailBlocking, confidence: c.ai.confidence, candidateInfo: c.ai.candidateInfo,
+        explanation: c.ai.explanation
+      } : null,
+      qa: c.qa, createdAt: c.createdAt, updatedAt: c.updatedAt
+    };
+  });
+
+  if (search) {
+    const q = search.toLowerCase();
+    list = list.filter(c => c.name.toLowerCase().includes(q) ||
+      (c.ai && (c.ai.candidateInfo.currentCompany || "").toLowerCase().includes(q)) ||
+      (c.linkedinUrl || "").toLowerCase().includes(q));
+  }
+  if (status) list = list.filter(c => c.status === status);
+  if (qaStatus) list = list.filter(c => c.qa.status === qaStatus);
+  if (recommendation) list = list.filter(c => c.ai && c.ai.recommendation === recommendation);
+  if (band) list = list.filter(c => c.ai && ratingBand(c.ai.overallScore).cls === band);
+  if (missingMandatory === "true") list = list.filter(c => c.ai && c.ai.hardFailBlocking);
+  if (scoreMin !== undefined || scoreMax !== undefined) list = list.filter(c => !c.ai || (c.ai.overallScore >= min && c.ai.overallScore <= max));
+
+  res.json({ candidates: list, projects: projects.map(p => ({ id: p.id, name: p.name })) });
+});
+
+/* ------------------------ Admin: QA Reviewer Activity --------------------- */
+// Feature: Admin-only reporting on QA reviewer activity (jobs reviewed, candidates checked, etc).
+// qa_history entries store `by` as a formatted "Name (Role)" display string rather than a user id,
+// so activity is grouped by that string and split back into name/role for display.
+router.get("/reports/qa-activity", requireRole("Admin"), (req, res) => {
+  const { projectId, from, to } = req.query;
+  const projects = listProjects();
+
+  const rows = projectId
+    ? db.prepare("SELECT id, project_id, qa_history FROM candidates WHERE project_id = ?").all(projectId)
+    : db.prepare("SELECT id, project_id, qa_history FROM candidates").all();
+
+  const fromTs = from ? new Date(from).getTime() : null;
+  const toTs = to ? new Date(to).getTime() + 24 * 60 * 60 * 1000 - 1 : null; // inclusive end-of-day
+
+  const byPerson = new Map(); // key: "Name (Role)" -> running stats
+
+  rows.forEach(r => {
+    let history;
+    try { history = JSON.parse(r.qa_history || "[]"); } catch (e) { history = []; }
+    history.forEach(h => {
+      const t = new Date(h.at).getTime();
+      if (fromTs !== null && (isNaN(t) || t < fromTs)) return;
+      if (toTs !== null && (isNaN(t) || t > toTs)) return;
+      const key = h.by || "Unknown";
+      if (!byPerson.has(key)) {
+        byPerson.set(key, {
+          by: key, actions: 0, projectIds: new Set(), candidateIds: new Set(),
+          scoreSum: 0, scoreCount: 0, statusChanges: {}, recommendationChanges: {}, lastActivity: null
+        });
+      }
+      const stat = byPerson.get(key);
+      stat.actions++;
+      stat.projectIds.add(r.project_id);
+      stat.candidateIds.add(r.id);
+      if (!stat.lastActivity || t > new Date(stat.lastActivity).getTime()) stat.lastActivity = h.at;
+      if (h.field === "score") { const n = Number(h.to); if (!isNaN(n)) { stat.scoreSum += n; stat.scoreCount++; } }
+      if (h.field === "status") stat.statusChanges[h.to] = (stat.statusChanges[h.to] || 0) + 1;
+      if (h.field === "recommendation") stat.recommendationChanges[h.to] = (stat.recommendationChanges[h.to] || 0) + 1;
+    });
+  });
+
+  const qaActivity = Array.from(byPerson.values()).map(s => {
+    const m = s.by.match(/^(.*)\s\(([^)]+)\)$/);
+    return {
+      name: m ? m[1] : s.by, role: m ? m[2] : "", rawLabel: s.by,
+      jobsReviewed: s.projectIds.size, candidatesChecked: s.candidateIds.size, totalActions: s.actions,
+      avgQaScoreGiven: s.scoreCount ? Number((s.scoreSum / s.scoreCount).toFixed(1)) : null,
+      statusBreakdown: s.statusChanges, recommendationBreakdown: s.recommendationChanges,
+      lastActivity: s.lastActivity
+    };
+  }).sort((a, b) => b.candidatesChecked - a.candidatesChecked);
+
+  res.json({ qaActivity, projects: projects.map(p => ({ id: p.id, name: p.name })) });
+});
+
 router.post("/candidates/:candId/notes", (req, res) => {
   if (req.user.role === "Viewer") return res.status(403).json({ error: "Viewers cannot add notes." });
   const c = db.prepare("SELECT * FROM candidates WHERE id = ?").get(req.params.candId);
@@ -178,10 +281,17 @@ router.post("/:id/analyze", async (req, res) => {
   const p = getProject(req.params.id, false);
   if (!p) return res.status(404).json({ error: "Project not found." });
   const onlyFailed = req.query.onlyFailed === "true";
+  // Feature: "Recalculate Score After Requirement Changes" — when requirements/weights/policies
+  // are edited, ?all=true re-runs analysis on EVERY candidate in the project, including ones
+  // already marked completed/needs_review, instead of the default "process new/unfinished only"
+  // behavior below.
+  const recalcAll = req.query.all === "true";
   const statusFilter = onlyFailed ? "failed" : null;
-  const targets = statusFilter
-    ? db.prepare("SELECT * FROM candidates WHERE project_id = ? AND status = ?").all(p.id, statusFilter)
-    : db.prepare("SELECT * FROM candidates WHERE project_id = ? AND status != 'completed' AND status != 'needs_review'").all(p.id);
+  const targets = recalcAll
+    ? db.prepare("SELECT * FROM candidates WHERE project_id = ?").all(p.id)
+    : statusFilter
+      ? db.prepare("SELECT * FROM candidates WHERE project_id = ? AND status = ?").all(p.id, statusFilter)
+      : db.prepare("SELECT * FROM candidates WHERE project_id = ? AND status != 'completed' AND status != 'needs_review'").all(p.id);
 
   if (!targets.length) return res.json({ started: false, message: "Nothing to process." });
 
