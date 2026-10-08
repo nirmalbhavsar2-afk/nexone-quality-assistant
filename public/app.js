@@ -55,7 +55,15 @@ const State = {
   liveAiConfigured: false,
   toasts: [],
   bulk: null,
-  pollHandle: null
+  pollHandle: null,
+  // Cross-project "All Candidates" database view
+  allCandidates: [],
+  allCandProjects: [],
+  allCandFilters: { search: "", projectId: "all", status: "all", band: "all", recommendation: "all", qaStatus: "all", missingMandatory: false },
+  // Admin QA reviewer activity reporting
+  qaActivity: [],
+  qaActivityProjects: [],
+  qaActivityFilters: { projectId: "all", from: "", to: "" }
 };
 window.State = State;
 
@@ -126,6 +134,7 @@ function startPolling() {
   State.pollHandle = setInterval(() => {
     if (State.view === "dashboard") loadProjects();
     else if (State.view === "candidates") refreshCurrentProject();
+    else if (State.view === "all-candidates") loadAllCandidates();
   }, 6000);
 }
 function stopPolling() { if (State.pollHandle) { clearInterval(State.pollHandle); State.pollHandle = null; } }
@@ -135,11 +144,17 @@ function stopPolling() { if (State.pollHandle) { clearInterval(State.pollHandle)
 async function goto(view, opts) {
   State.view = view;
   if (opts && opts.candidateId !== undefined) State.candidateDetailId = opts.candidateId;
+  if (opts && opts.back !== undefined) State.candidateDetailBack = opts.back;
   window.scrollTo(0, 0);
   render();
   if (view === "dashboard") await loadProjects();
   if (view === "projects") await loadProjects();
-  if (view === "settings" && canEditSettings()) { try { State.users = await apiGet("/users"); } catch (e) {} render(); }
+  if (view === "all-candidates") { await loadProjects(); await loadAllCandidates(); }
+  if (view === "settings" && canEditSettings()) {
+    try { State.users = await apiGet("/users"); } catch (e) {}
+    if (settingsTab === "qa-activity") await loadQaActivity();
+    render();
+  }
   startPolling();
 }
 window.goto = goto;
@@ -149,7 +164,7 @@ window.goto = goto;
 const NAV_ITEMS = [
   { id: "dashboard", label: "Dashboard", icon: "&#9737;" },
   { id: "new-review", label: "New Review", icon: "&#43;" },
-  { id: "candidates", label: "Candidates", icon: "&#128100;" },
+  { id: "all-candidates", label: "Candidates", icon: "&#128100;" },
   { id: "projects", label: "Projects", icon: "&#128193;" },
   { id: "reports", label: "Reports", icon: "&#128202;" },
   { id: "settings", label: "Settings", icon: "&#9881;" }
@@ -210,6 +225,7 @@ function topbarTitle() {
     case "dashboard": return "Dashboard";
     case "new-review": return "New Candidate Review";
     case "candidates": return State.currentProject ? escapeHtml(State.currentProject.name) : "Candidates";
+    case "all-candidates": return "All Candidates";
     case "projects": return "Projects";
     case "reports": return "Reports";
     case "settings": return "Settings";
@@ -223,7 +239,8 @@ function topbarActions() {
     return `<button class="btn btn-sm" onclick="refreshCurrentProject()">&#8635; Refresh</button>
       <button class="btn btn-sm btn-primary" onclick="exportCSV()">&#8681; Download CSV</button>`;
   }
-  if (State.view === "candidate-detail") return `<button class="btn btn-sm" onclick="goto('candidates')">&larr; Back to Candidates</button>`;
+  if (State.view === "all-candidates") return `<button class="btn btn-sm" onclick="loadAllCandidates()">&#8635; Refresh</button>`;
+  if (State.view === "candidate-detail") return `<button class="btn btn-sm" onclick="goto(State.candidateDetailBack || 'candidates')">&larr; Back</button>`;
   if (State.view === "edit-requirements") return `<button class="btn btn-sm" onclick="cancelEditRequirements()">&larr; Cancel</button>`;
   return `<button class="btn btn-sm btn-primary" onclick="goto('new-review')">+ New Review</button>`;
 }
@@ -232,6 +249,7 @@ function renderView() {
     case "dashboard": return viewDashboard();
     case "new-review": return viewNewReview();
     case "candidates": return viewCandidates();
+    case "all-candidates": return viewAllCandidates();
     case "candidate-detail": return viewCandidateDetail();
     case "projects": return viewProjects();
     case "reports": return viewReports();
@@ -859,18 +877,42 @@ async function saveEditRequirements() {
     const updated = await apiPut(`/projects/${er.projectId}`, { jd: er.jd });
     const hadProject = State.currentProject && State.currentProject.id === er.projectId;
     if (hadProject) State.currentProject = updated;
+    const projectId = er.projectId, projectName = er.projectName;
     State.editReq = null;
     await loadProjects();
-    toast("Requirements updated. Re-run analysis to apply to existing candidates.", "ok");
     goto(hadProject ? "candidates" : "projects");
+    offerRecalcAfterEdit(projectId, projectName);
   } catch (e) { toast("Could not save requirements: " + e.message, "err"); }
+}
+
+/* ===================== Feature: Recalculate After Requirement Changes ===== */
+
+function offerRecalcAfterEdit(projectId, projectName) {
+  Modal.open({
+    title: "Requirements Updated",
+    body: `<p>Requirements for <b>${escapeHtml(projectName)}</b> were saved. Would you like to recalculate scores for all existing candidates now, using the updated requirements?</p>`,
+    footer: `<button class="btn" onclick="Modal.close()">Not Now</button>
+      <button class="btn btn-primary" onclick="Modal.close(); runBulkAnalysis('${projectId}', false, true)">Recalculate Now</button>`
+  });
+}
+
+function confirmRecalcAll(projectId) {
+  const p = State.currentProject;
+  const total = p ? p.candidates.length : 0;
+  Modal.open({
+    title: "Recalculate All Candidates",
+    body: `<p>This re-runs AI evaluation on all ${total} candidate(s) in this project using the current job requirements, scoring weights, and screening policies &mdash; including candidates already scored. This may take a few moments.</p>`,
+    footer: `<button class="btn" onclick="Modal.close()">Cancel</button>
+      <button class="btn btn-primary" onclick="Modal.close(); runBulkAnalysis('${projectId}', false, true)">Recalculate All</button>`
+  });
 }
 
 /* ============================== BULK ANALYSIS ============================= */
 
-async function runBulkAnalysis(projectId, onlyFailed) {
+async function runBulkAnalysis(projectId, onlyFailed, recalcAll) {
   try {
-    const resp = await apiPost(`/projects/${projectId}/analyze${onlyFailed ? "?onlyFailed=true" : ""}`, {});
+    const qs = recalcAll ? "?all=true" : (onlyFailed ? "?onlyFailed=true" : "");
+    const resp = await apiPost(`/projects/${projectId}/analyze${qs}`, {});
     if (!resp.started) { toast(resp.message || "Nothing to process.", ""); return; }
   } catch (e) { toast("Could not start analysis: " + e.message, "err"); return; }
 
@@ -938,6 +980,7 @@ function viewCandidates() {
       <div class="card-title" style="margin:0">Candidate Leaderboard <span class="muted small" style="font-weight:400">${list.length} of ${p.candidates.length} shown</span></div>
       <div class="flex gap-8">
         ${!isReadOnly() ? `<button class="btn btn-sm" onclick="openAddCandidatesModal()">+ Add Candidates</button>` : ""}
+        ${!isReadOnly() && p.candidates.length > 0 ? `<button class="btn btn-sm" onclick="confirmRecalcAll('${p.id}')">&#8635; Recalculate All</button>` : ""}
         ${notYetProcessed > 0 ? `<button class="btn btn-sm btn-primary" onclick="runBulkAnalysis('${p.id}')">Analyze ${notYetProcessed} Pending</button>` : ""}
       </div>
     </div>
@@ -966,7 +1009,7 @@ function viewCandidates() {
         const band = ratingBandClient(c.ai.overallScore);
         const reqMatched = c.ai.skills.matched.filter(s => s.required).length;
         const reqTotal = reqMatched + c.ai.skills.missing.filter(s => s.required).length;
-        return `<tr class="clickable" onclick="goto('candidate-detail',{candidateId:'${c.id}'})">
+        return `<tr class="clickable" onclick="goto('candidate-detail',{candidateId:'${c.id}',back:'candidates'})">
           <td>${i + 1}</td><td><b>${escapeHtml(c.name)}</b><div class="muted small">${escapeHtml(c.ai.candidateInfo.currentTitle)}</div></td>
           <td><span class="badge ${band.cls}">${fmt1(c.ai.overallScore)}/10</span></td>
           <td>${fmt1(c.ai.candidateInfo.relevantExperienceYears)} yrs</td>
@@ -991,6 +1034,83 @@ function sortArrow(key) { if (State.candSort.key !== key) return ""; return `<sp
 function setSort(key) { if (State.candSort.key === key) State.candSort.dir = State.candSort.dir === "asc" ? "desc" : "asc"; else { State.candSort.key = key; State.candSort.dir = "desc"; } render(); }
 function recBadge(rec) { const map = { "Strongly Recommend": "badge-green", "Recommend": "badge-blue", "Consider": "badge-amber", "Do Not Recommend": "badge-red" }; return `<span class="badge ${map[rec] || "badge-gray"}">${escapeHtml(rec)}</span>`; }
 function qaBadge(s) { const map = { "Not Reviewed": "badge-gray", "Reviewed": "badge-blue", "Approved": "badge-green", "Rejected": "badge-red", "Needs Verification": "badge-amber" }; return `<span class="badge ${map[s] || "badge-gray"}">${escapeHtml(s)}</span>`; }
+
+/* ============================== ALL CANDIDATES (cross-project database) === */
+
+async function loadAllCandidates() {
+  const f = State.allCandFilters;
+  const params = new URLSearchParams();
+  if (f.projectId !== "all") params.set("projectId", f.projectId);
+  if (f.search) params.set("search", f.search);
+  if (f.status !== "all") params.set("status", f.status);
+  if (f.band !== "all") params.set("band", f.band);
+  if (f.recommendation !== "all") params.set("recommendation", f.recommendation);
+  if (f.qaStatus !== "all") params.set("qaStatus", f.qaStatus);
+  if (f.missingMandatory) params.set("missingMandatory", "true");
+  try {
+    const data = await apiGet(`/projects/candidates/all?${params.toString()}`);
+    State.allCandidates = data.candidates;
+    State.allCandProjects = data.projects;
+  } catch (e) { toast("Could not load candidates: " + e.message, "err"); }
+  render();
+}
+
+function viewAllCandidates() {
+  const f = State.allCandFilters;
+  const list = State.allCandidates || [];
+  return `<div class="card">
+    <div class="flex-between"><div class="card-title" style="margin:0">All Candidates <span class="muted small" style="font-weight:400">${list.length} shown across ${(State.allCandProjects || []).length} project(s)</span></div></div>
+    <div class="row" style="flex-wrap:wrap;gap:10px;margin-bottom:12px;">
+      <input class="input" style="max-width:220px" placeholder="Search name/company" value="${escapeHtml(f.search)}"
+        oninput="State.allCandFilters.search=this.value" onkeydown="if(event.key==='Enter') loadAllCandidates()" onblur="loadAllCandidates()"/>
+      <select class="input" style="max-width:220px" onchange="State.allCandFilters.projectId=this.value;loadAllCandidates()">
+        <option value="all" ${f.projectId === "all" ? "selected" : ""}>All Projects</option>
+        ${(State.allCandProjects || []).map(p => `<option value="${p.id}" ${f.projectId === p.id ? "selected" : ""}>${escapeHtml(p.name)}</option>`).join("")}
+      </select>
+      <select class="input" style="max-width:150px" onchange="State.allCandFilters.status=this.value;loadAllCandidates()">
+        <option value="all">All Statuses</option>
+        ${["pending", "processing", "completed", "needs_review", "failed"].map(s => `<option value="${s}" ${f.status === s ? "selected" : ""}>${s.replace("_", " ")}</option>`).join("")}
+      </select>
+      <select class="input" style="max-width:170px" onchange="State.allCandFilters.band=this.value;loadAllCandidates()">
+        <option value="all">All Match Bands</option>
+        ${["band-excellent:Excellent", "band-strong:Strong", "band-good:Good", "band-possible:Possible", "band-weak:Weak", "band-poor:Poor"].map(o => { const [v, l] = o.split(":"); return `<option value="${v}" ${f.band === v ? "selected" : ""}>${l}</option>`; }).join("")}
+      </select>
+      <select class="input" style="max-width:190px" onchange="State.allCandFilters.recommendation=this.value;loadAllCandidates()">
+        <option value="all">All Recommendations</option>
+        ${["Strongly Recommend", "Recommend", "Consider", "Do Not Recommend"].map(r => `<option value="${r}" ${f.recommendation === r ? "selected" : ""}>${r}</option>`).join("")}
+      </select>
+      <select class="input" style="max-width:170px" onchange="State.allCandFilters.qaStatus=this.value;loadAllCandidates()">
+        <option value="all">All QA Status</option>
+        ${["Not Reviewed", "Reviewed", "Approved", "Rejected", "Needs Verification"].map(s => `<option value="${s}" ${f.qaStatus === s ? "selected" : ""}>${s}</option>`).join("")}
+      </select>
+      <label class="flex gap-8" style="white-space:nowrap"><input type="checkbox" ${f.missingMandatory ? "checked" : ""} onchange="State.allCandFilters.missingMandatory=this.checked;loadAllCandidates()"/> Missing mandatory only</label>
+    </div>
+    <table class="tbl"><thead><tr>
+      <th>Candidate</th><th>Project</th><th>Status</th><th>Score</th><th>Relevant Exp</th><th>Recommendation</th><th>QA Status</th><th>QA Score</th><th>QA Comments</th>
+    </tr></thead><tbody>
+    ${list.map(c => {
+      const band = c.ai ? ratingBandClient(c.ai.overallScore) : null;
+      const comments = c.qa.comments || "";
+      return `<tr class="clickable" onclick="openCandidateFromAllList('${c.projectId}','${c.id}')">
+        <td><b>${escapeHtml(c.name)}</b>${c.ai ? `<div class="muted small">${escapeHtml(c.ai.candidateInfo.currentTitle || "")}</div>` : ""}</td>
+        <td>${escapeHtml(c.projectName)}</td>
+        <td class="small">${escapeHtml((c.status || "").replace("_", " "))}</td>
+        <td>${c.ai ? `<span class="badge ${band.cls}">${fmt1(c.ai.overallScore)}/10</span>` : "&mdash;"}</td>
+        <td>${c.ai ? fmt1(c.ai.candidateInfo.relevantExperienceYears) + " yrs" : "&mdash;"}</td>
+        <td>${c.ai ? recBadge(c.ai.recommendation) : "&mdash;"}</td>
+        <td>${qaBadge(c.qa.status)}</td>
+        <td>${c.qa.score !== null && c.qa.score !== undefined ? fmt1(c.qa.score) : "&mdash;"}</td>
+        <td class="small">${escapeHtml(comments.slice(0, 80))}${comments.length > 80 ? "&hellip;" : ""}</td>
+      </tr>`;
+    }).join("")}
+    ${list.length === 0 ? `<tr><td colspan="9" class="muted" style="text-align:center;padding:30px;">No candidates match the current filters.</td></tr>` : ""}
+    </tbody></table>
+  </div>`;
+}
+async function openCandidateFromAllList(projectId, candidateId) {
+  await openProject(projectId);
+  goto("candidate-detail", { candidateId, back: "all-candidates" });
+}
 
 /* ============================== ADD CANDIDATES (existing project) ========= */
 
@@ -1140,6 +1260,16 @@ function viewCandidateDetail() {
     </div>
   </div>
 
+  ${ai.roleBreakdown && ai.roleBreakdown.length ? `<div class="card"><div class="card-title">Role-by-Role Experience Breakdown <span class="muted small" style="font-weight:400">From live AI review</span></div>
+    <table class="tbl"><thead><tr><th>Title</th><th>Company</th><th>Dates</th><th>Years</th><th>Relevant?</th><th>Reason</th></tr></thead>
+      <tbody>${ai.roleBreakdown.map(r => `<tr>
+        <td>${escapeHtml(r.title || "")}</td><td>${escapeHtml(r.company || "")}</td>
+        <td>${escapeHtml(r.start || "")} - ${escapeHtml(r.end || "")}</td>
+        <td>${r.yearsInRole !== undefined && r.yearsInRole !== null ? fmt1(r.yearsInRole) : ""}</td>
+        <td>${r.relevant ? '<span class="badge badge-green">Yes</span>' : '<span class="badge badge-gray">No</span>'}</td>
+        <td class="small">${escapeHtml(r.reason || "")}</td>
+      </tr>`).join("")}</tbody></table></div>` : ""}
+
   <div class="card"><div class="card-title">Skills Match</div>
     <table class="tbl skill-table"><thead><tr><th>Skill</th><th>Required</th><th>Candidate</th><th>Match</th></tr></thead>
       <tbody>${skillRows || `<tr><td colspan="4" class="muted">No skills configured on this job description.</td></tr>`}</tbody></table></div>
@@ -1263,9 +1393,15 @@ async function openProjectAndStay(id) { await openProject(id); }
 let settingsTab = "project";
 function viewSettings() {
   const tabs = [["project", "Scoring & Policy"], ["export", "Export Columns"], ["ai", "AI Settings"]];
-  if (canEditSettings()) tabs.push(["users", "Users"]);
-  return `<div class="tabs no-print">${tabs.map(([id, label]) => `<div class="tab ${settingsTab === id ? "active" : ""}" onclick="settingsTab='${id}';render()">${label}</div>`).join("")}</div>
-    ${settingsTab === "project" ? settingsProjectTab() : settingsTab === "export" ? settingsExportTab() : settingsTab === "ai" ? settingsAiTab() : settingsUsersTab()}`;
+  if (canEditSettings()) tabs.push(["users", "Users"], ["qa-activity", "QA Activity"]);
+  return `<div class="tabs no-print">${tabs.map(([id, label]) => `<div class="tab ${settingsTab === id ? "active" : ""}" onclick="switchSettingsTab('${id}')">${label}</div>`).join("")}</div>
+    ${settingsTab === "project" ? settingsProjectTab() : settingsTab === "export" ? settingsExportTab() : settingsTab === "ai" ? settingsAiTab()
+      : settingsTab === "qa-activity" ? settingsQaActivityTab() : settingsUsersTab()}`;
+}
+function switchSettingsTab(id) {
+  settingsTab = id;
+  if (id === "qa-activity") loadQaActivity();
+  else render();
 }
 
 function settingsProjectTab() {
@@ -1337,6 +1473,54 @@ function settingsAiTab() {
     ${State.liveAiConfigured
       ? `<div class="badge badge-green">Live AI configured</div><p class="muted mt-8">This server has an organization-wide Anthropic API key configured (server-side only — never sent to browsers). All candidate evaluations use live LLM-assisted analysis, falling back to the built-in rules engine automatically if the API call fails.</p>`
       : `<div class="badge badge-gray">Built-in rules engine (default)</div><p class="muted mt-8">No AI provider key is configured on this server, so evaluations use the deterministic, explainable rules engine. An Admin can enable live LLM-assisted evaluation by setting <code>ANTHROPIC_API_KEY</code> in the server's environment and restarting — see DEPLOY.md.</p>`}
+  </div>`;
+}
+
+/* ===================== Admin: QA Reviewer Activity Report ================= */
+
+async function loadQaActivity() {
+  const f = State.qaActivityFilters;
+  const params = new URLSearchParams();
+  if (f.projectId !== "all") params.set("projectId", f.projectId);
+  if (f.from) params.set("from", f.from);
+  if (f.to) params.set("to", f.to);
+  try {
+    const data = await apiGet(`/projects/reports/qa-activity?${params.toString()}`);
+    State.qaActivity = data.qaActivity;
+    State.qaActivityProjects = data.projects;
+  } catch (e) { toast("Could not load QA activity: " + e.message, "err"); }
+  render();
+}
+
+function settingsQaActivityTab() {
+  const f = State.qaActivityFilters;
+  const rows = State.qaActivity || [];
+  return `<div class="card">
+    <div class="card-title">QA Reviewer Activity <span class="muted small" style="font-weight:400">Jobs reviewed, candidates checked, and review activity per QA person &mdash; across all projects</span></div>
+    <div class="row" style="flex-wrap:wrap;gap:10px;margin-bottom:12px;align-items:flex-end;">
+      <select class="input" style="max-width:220px" onchange="State.qaActivityFilters.projectId=this.value;loadQaActivity()">
+        <option value="all" ${f.projectId === "all" ? "selected" : ""}>All Projects</option>
+        ${(State.qaActivityProjects || []).map(p => `<option value="${p.id}" ${f.projectId === p.id ? "selected" : ""}>${escapeHtml(p.name)}</option>`).join("")}
+      </select>
+      <div class="field" style="margin:0"><label class="small muted">From</label><input type="date" class="input" value="${f.from}" onchange="State.qaActivityFilters.from=this.value;loadQaActivity()"/></div>
+      <div class="field" style="margin:0"><label class="small muted">To</label><input type="date" class="input" value="${f.to}" onchange="State.qaActivityFilters.to=this.value;loadQaActivity()"/></div>
+      <button class="btn btn-sm" onclick="loadQaActivity()">&#8635; Refresh</button>
+    </div>
+    <table class="tbl"><thead><tr>
+      <th>QA Person</th><th>Role</th><th>Jobs Reviewed</th><th>Candidates Checked</th><th>Total QA Actions</th><th>Avg QA Score Given</th><th>Status Changes</th><th>Last Activity</th>
+    </tr></thead><tbody>
+    ${rows.map(r => `<tr>
+      <td><b>${escapeHtml(r.name)}</b></td>
+      <td class="muted small">${escapeHtml(r.role)}</td>
+      <td>${r.jobsReviewed}</td>
+      <td>${r.candidatesChecked}</td>
+      <td>${r.totalActions}</td>
+      <td>${r.avgQaScoreGiven !== null && r.avgQaScoreGiven !== undefined ? fmt1(r.avgQaScoreGiven) : "&mdash;"}</td>
+      <td class="small">${Object.entries(r.statusBreakdown || {}).map(([s, n]) => `${escapeHtml(s)}: ${n}`).join(", ") || "&mdash;"}</td>
+      <td class="muted small">${r.lastActivity ? new Date(r.lastActivity).toLocaleString() : "&mdash;"}</td>
+    </tr>`).join("")}
+    ${rows.length === 0 ? `<tr><td colspan="8" class="muted" style="text-align:center;padding:30px;">No QA activity recorded yet${f.projectId !== "all" || f.from || f.to ? " for the selected filters" : ""}.</td></tr>` : ""}
+    </tbody></table>
   </div>`;
 }
 
